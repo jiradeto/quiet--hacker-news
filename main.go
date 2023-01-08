@@ -14,6 +14,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type Mode int
+
+const (
+	Vanilla Mode = iota
+	Concurrent
+	ConcurrentWithCache
+)
 const (
 	HN_ENDPOINT = "https://hacker-news.firebaseio.com/v0"
 	BATCH_SIZE  = 8
@@ -47,62 +54,25 @@ func hiHandler(ctx *gin.Context) {
 		"message": "hello there!",
 	})
 }
-
-func feedConcurrentHandler(numStories *int, cacheEnabled bool) gin.HandlerFunc {
+func feedHandler(mode Mode, numStories *int) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		client := hn.New(HN_ENDPOINT)
 		start := time.Now()
 		ids, err := client.TopItems()
-		forceFetch := true
-		if cacheEnabled {
-			forceFetch = false
-		}
-
-		rankingMap := map[int]int{}
-		for i, id := range ids {
-			rankingMap[id] = i
-		}
 
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, err)
 		}
-
-		var stories []item
-		batchSize := BATCH_SIZE
-		for i := 0; i < len(ids); i += batchSize {
-			j := i + batchSize
-			if j > len(ids) {
-				j = len(ids)
-			}
-
-			var wg sync.WaitGroup
-			batchIds := ids[i:j]
-			wg.Add(len(batchIds))
-			for _, itemID := range batchIds {
-				go func(id int) {
-					defer wg.Done()
-					fmt.Printf("[%v] - GettingItem: Start\n", id)
-					hnItem, err := client.GetItem(id, forceFetch)
-					if err != nil {
-						fmt.Println("some error here", err)
-					}
-					fmt.Printf("[%v] - GettingItem: Done\n", id)
-					item := parseHNItem(hnItem)
-					if isStoryLink(item) {
-						stories = append(stories, item)
-					}
-				}(itemID)
-			}
-			wg.Wait()
-			fmt.Println("I am checking size: ", len(stories))
-			if len(stories) >= *numStories {
-				break
-			}
+		feedConfigs := &feedConfigs{
+			Mode:       mode,
+			NumStories: *numStories,
+			IDs:        ids,
+			Client:     hn.New(HN_ENDPOINT),
 		}
-		sort.Slice(stories, func(i, j int) bool {
-			return rankingMap[stories[i].ID] < rankingMap[stories[j].ID]
-		})
-		stories = stories[:*numStories]
+		stories, err := fetchTopStories(feedConfigs)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, err)
+		}
 		data := templateData{
 			Stories: stories,
 			Time:    time.Since(start),
@@ -112,38 +82,78 @@ func feedConcurrentHandler(numStories *int, cacheEnabled bool) gin.HandlerFunc {
 		})
 	}
 }
-func feedHandler(numStories *int) gin.HandlerFunc {
-	return func(ctx *gin.Context) {
-		client := hn.New(HN_ENDPOINT)
-		start := time.Now()
-		ids, err := client.TopItems()
 
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, err)
-		}
-
-		var stories []item
-		for _, id := range ids {
-			hnItem, err := client.GetItem(id, false)
-			if err != nil {
-				continue
-			}
-			item := parseHNItem(hnItem)
-			if isStoryLink(item) {
-				stories = append(stories, item)
-				if len(stories) >= *numStories {
-					break
-				}
-			}
-		}
-		data := templateData{
-			Stories: stories,
-			Time:    time.Since(start),
-		}
-		ctx.HTML(http.StatusOK, "index.html", gin.H{
-			"data": data,
-		})
+func fetchConcurrent(config *feedConfigs) ([]item, error) {
+	rankingMap := map[int]int{}
+	for i, id := range config.IDs {
+		rankingMap[id] = i
 	}
+	var stories []item
+	batchSize := BATCH_SIZE
+	for i := 0; i < len(config.IDs); i += batchSize {
+		j := i + batchSize
+		if j > len(config.IDs) {
+			j = len(config.IDs)
+		}
+		var wg sync.WaitGroup
+		batchIds := config.IDs[i:j]
+		wg.Add(len(batchIds))
+		for _, itemID := range batchIds {
+			go func(id int) {
+				defer wg.Done()
+				fmt.Printf("[%v] - GettingItem: Start\n", id)
+				hnItem, err := config.Client.GetItem(id, config.Mode == Concurrent)
+				if err != nil {
+					fmt.Println("some error here", err)
+				}
+				fmt.Printf("[%v] - GettingItem: Done\n", id)
+				item := parseHNItem(hnItem)
+				if isStoryLink(item) {
+					stories = append(stories, item)
+				}
+			}(itemID)
+		}
+		wg.Wait()
+		if len(stories) >= config.NumStories {
+			break
+		}
+	}
+	sort.Slice(stories, func(i, j int) bool {
+		return rankingMap[stories[i].ID] < rankingMap[stories[j].ID]
+	})
+	stories = stories[:config.NumStories]
+	return stories, nil
+}
+func fetchVanilla(config *feedConfigs) ([]item, error) {
+	var stories []item
+	for _, id := range config.IDs {
+		hnItem, err := config.Client.GetItem(id, true)
+		if err != nil {
+			continue
+		}
+		item := parseHNItem(hnItem)
+		if isStoryLink(item) {
+			stories = append(stories, item)
+			if len(stories) >= config.NumStories {
+				break
+			}
+		}
+	}
+	return stories, nil
+}
+
+func fetchTopStories(config *feedConfigs) ([]item, error) {
+	if config.Mode == Vanilla {
+		return fetchVanilla(config)
+	}
+	return fetchConcurrent(config)
+}
+
+type feedConfigs struct {
+	Mode       Mode
+	NumStories int
+	IDs        []int
+	Client     *hn.Client
 }
 
 func main() {
@@ -153,11 +163,11 @@ func main() {
 	flag.Parse()
 
 	// typical fetch
-	r.GET("/feed", feedHandler(numStories))
+	r.GET("/feed", feedHandler(Vanilla, numStories))
 	// fetch concurrently
-	r.GET("/feedc", feedConcurrentHandler(numStories, false))
+	r.GET("/feedc", feedHandler(Concurrent, numStories))
 	// fetch concurrently with cache
-	r.GET("/feedcc", feedConcurrentHandler(numStories, true))
+	r.GET("/feedcc", feedHandler(ConcurrentWithCache, numStories))
 	// check
 	r.GET("/hi", hiHandler)
 	r.Run()
