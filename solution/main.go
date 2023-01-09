@@ -126,13 +126,14 @@ func fetchConcurrent(config *feedConfigs) ([]item, error) {
 	var stories []item
 	start := 0
 	for len(stories) < config.NumStories {
-		needed := (config.NumStories - len(stories))
+		needed := (config.NumStories - len(stories)) * 5 / 4
 		end := start + needed
+		fmt.Println("loop start:", start, end)
 		newStories := performConcurrentFetch(config, config.IDs[start:end])
 		stories = append(stories, newStories...)
 		start = end
 	}
-	return stories, nil
+	return stories[:config.NumStories], nil
 }
 func fetchVanilla(config *feedConfigs) ([]item, error) {
 	var stories []item
@@ -152,11 +153,25 @@ func fetchVanilla(config *feedConfigs) ([]item, error) {
 	return stories, nil
 }
 
+var (
+	cachedStories     []item
+	cacheExpirationAt time.Time
+)
+
 func fetchTopStories(config *feedConfigs) ([]item, error) {
-	if config.Mode == FetchModeVanilla {
-		return fetchVanilla(config)
+	if time.Since(cacheExpirationAt) < 0 {
+		return cachedStories, nil
 	}
-	return fetchConcurrent(config)
+	var stories []item
+	var err error
+	if config.Mode == FetchModeVanilla {
+		stories, err = fetchVanilla(config)
+	} else {
+		stories, err = fetchConcurrent(config)
+	}
+	cachedStories = stories
+	cacheExpirationAt = time.Now().Add(1 * time.Second)
+	return cachedStories, err
 }
 
 type feedConfigs struct {
