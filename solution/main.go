@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,6 +26,7 @@ const (
 )
 
 type item struct {
+	idx int
 	hn.Item
 	Host string
 }
@@ -83,45 +83,55 @@ func feedHandler(mode FetchMode, numStories *int) gin.HandlerFunc {
 	}
 }
 
-func fetchConcurrent(config *feedConfigs) ([]item, error) {
-	rankingMap := map[int]int{}
-	for i, id := range config.IDs {
-		rankingMap[id] = i
+func performConcurrentFetch(config *feedConfigs, ids []int) []item {
+	type result struct {
+		idx  int
+		err  error
+		item item
 	}
-	var stories []item
-	batchSize := BATCH_SIZE
-	for i := 0; i < len(config.IDs); i += batchSize {
-		j := i + batchSize
-		if j > len(config.IDs) {
-			j = len(config.IDs)
-		}
-		var wg sync.WaitGroup
-		batchIds := config.IDs[i:j]
-		wg.Add(len(batchIds))
-		for _, itemID := range batchIds {
-			go func(id int) {
-				defer wg.Done()
-				fmt.Printf("[%v] - GettingItem: Start\n", id)
-				hnItem, err := config.Client.GetItem(id, config.Mode == FetchModeConcurrent)
-				if err != nil {
-					fmt.Println("some error here", err)
-				}
-				fmt.Printf("[%v] - GettingItem: Done\n", id)
-				item := parseHNItem(hnItem)
-				if isStoryLink(item) {
-					stories = append(stories, item)
-				}
-			}(itemID)
-		}
-		wg.Wait()
-		if len(stories) >= config.NumStories {
-			break
-		}
+	resultChannel := make(chan result)
+
+	for i := 0; i < len(ids); i++ {
+		go func(id, idx int) {
+			fmt.Printf("GettingItem [%v]: Start\n", id)
+			hnItem, err := config.Client.GetItem(id, config.Mode == FetchModeConcurrent)
+			if err != nil {
+				resultChannel <- result{idx: idx, err: err}
+			}
+			resultChannel <- result{idx: idx, item: parseHNItem(hnItem)}
+			fmt.Printf("GettingItem [%v]: Done\n", id)
+
+		}(ids[i], i)
 	}
-	sort.Slice(stories, func(i, j int) bool {
-		return rankingMap[stories[i].ID] < rankingMap[stories[j].ID]
+
+	var results []result
+	for i := 0; i < len(ids); i++ {
+		results = append(results, <-resultChannel)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].idx < results[j].idx
 	})
-	stories = stories[:config.NumStories]
+
+	var items []item
+	for _, result := range results {
+		if result.err == nil && isStoryLink(result.item) {
+			items = append(items, result.item)
+		}
+	}
+	return items
+}
+
+func fetchConcurrent(config *feedConfigs) ([]item, error) {
+	var stories []item
+	start := 0
+	for len(stories) < config.NumStories {
+		needed := (config.NumStories - len(stories))
+		end := start + needed
+		newStories := performConcurrentFetch(config, config.IDs[start:end])
+		stories = append(stories, newStories...)
+		start = end
+	}
 	return stories, nil
 }
 func fetchVanilla(config *feedConfigs) ([]item, error) {
@@ -159,7 +169,7 @@ type feedConfigs struct {
 func main() {
 	r := gin.Default()
 	r.LoadHTMLGlob("templates/*")
-	numStories := flag.Int("limit", 5, "number of hacker news stories to fetch")
+	numStories := flag.Int("limit", 20, "number of hacker news stories to fetch")
 	flag.Parse()
 
 	// typical fetch
